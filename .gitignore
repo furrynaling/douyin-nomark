@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# 运行产物（别提交下载结果）
+*.mp4
+*.zip
+_sheet_*.jpg
+out/
