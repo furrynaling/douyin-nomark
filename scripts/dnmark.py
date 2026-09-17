@@ -114,6 +114,9 @@ def parse_aweme_id(text):
     m1 = re.search(r"/(?:video|note|share/video|share/note)/(\d{6,})", url)
     if m1:
         return m1.group(1), ("note" if "note" in url else "video")
+    m0 = re.search(r"/(?:music|share/music)/(\d{6,})", url)
+    if m0:
+        return m0.group(1), "music"
     # 短链：跟随 302，拿 location
     try:
         req = urllib.request.Request(url, headers={"User-Agent": UA_MOBILE})
@@ -123,11 +126,89 @@ def parse_aweme_id(text):
         final = e.headers.get("Location", "")
     except Exception:
         final = ""
+    m3 = re.search(r"/(?:music|share/music)/(\d{6,})", final)
+    if m3:
+        return m3.group(1), "music"
     m2 = re.search(r"/(video|note)/(\d{6,})", final) or re.search(r"(\d{15,})", final)
     if m2:
         gid = m2.group(m2.lastindex)
         return gid, ("note" if "note" in final else "video")
     raise ValueError("解析 aweme_id 失败：%s" % url)
+
+
+def fetch_music(music_id):
+    """音乐/原声详情（share/music/xxx 这类链接）：返回 music_info，含 play_url(mp3 直链)"""
+    last = None
+    for refresh in (False, True):
+        ttwid = get_ttwid(refresh=refresh)
+        api = ("https://www.douyin.com/aweme/v1/web/music/detail/?music_id=%s"
+               "&device_platform=webapp&aid=6383&channel=channel_pc_web" % music_id)
+        try:
+            body = http(api, headers={"Referer": "https://www.douyin.com/music/%s" % music_id,
+                                      "Cookie": "ttwid=" + ttwid}, timeout=30)
+            mi = json.loads(body).get("music_info")
+            if mi:
+                return mi
+            last = "接口返回空"
+        except Exception as e:              # noqa
+            last = "%s: %s" % (type(e).__name__, e)
+    raise RuntimeError("拿不到音乐数据（%s）" % last)
+
+
+def _music_extra(mi):
+    """music_info.extra 有时是 JSON 字符串（不是 dict），取出抖音标注的曲目名"""
+    extra = mi.get("extra")
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except Exception:
+            extra = {}
+    return (extra or {}).get("music_display_mapping_title")
+
+
+def download_music(music_id, out_dir, as_json):
+    mi = fetch_music(music_id)
+    title = mi.get("title") or ("music-%s" % music_id)
+    author = mi.get("author") or mi.get("owner_nickname") or "douyin"
+    name = safe_name("%s-%s" % (author, title))
+    urls = ((mi.get("play_url") or {}).get("url_list") or []) if isinstance(mi.get("play_url"), dict) \
+        else (mi.get("play_url") or [])
+    if not urls:
+        raise RuntimeError("没拿到音频直链")
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, name + ".mp3")
+    size = 0
+    for u in urls[:3]:
+        try:
+            size = http_download(u, path)
+            if size > 10000:
+                break
+        except Exception:
+            continue
+    if size <= 10000:
+        raise RuntimeError("音频下载失败")
+    dur = ""
+    if shutil_which("ffprobe"):
+        try:
+            dur = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                                  "format=duration", "-of", "csv=p=0", path],
+                                 capture_output=True, text=True, timeout=20).stdout.strip()
+        except Exception:
+            dur = ""
+    res = {"ok": True, "type": "music", "path": path, "size_mb": round(size / 1048576, 2),
+           "duration_s": round(float(dur), 1) if dur else None,
+           "title": title, "author": author, "music_id": music_id,
+           "mapped_track": _music_extra(mi),
+           "cover": ((mi.get("cover_large") or {}).get("url_list") or [None])[0]}
+    if as_json:
+        print(json.dumps(res, ensure_ascii=False))
+    else:
+        print("音乐：%s — %s" % (author, title))
+        print("  文件：%s（%.2f MB%s）" % (path, size / 1048576,
+                                        "，%s 秒" % res["duration_s"] if res["duration_s"] else ""))
+        if res["mapped_track"]:
+            print("  抖音标注曲目：%s" % res["mapped_track"])
+    return 0
 
 
 def fetch_detail(aweme_id, kind="video"):
@@ -273,6 +354,8 @@ def cmd_doctor():
 
 def cmd_download(link, out_dir, as_json, do_zip, do_sheet):
     aweme_id, kind = parse_aweme_id(link)
+    if kind == "music":                     # 音乐/原声链接：直接拿 mp3 直链
+        return download_music(aweme_id, out_dir, as_json)
     det = fetch_detail(aweme_id, kind)
     author = safe_name((det.get("author") or {}).get("nickname") or "douyin", 24)
     desc = safe_name(det.get("desc") or aweme_id)
